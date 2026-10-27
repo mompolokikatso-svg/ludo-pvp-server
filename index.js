@@ -138,6 +138,71 @@ async function handleLogin(req, res) {
   });
 }
 
+async function handleMatches(req, res) {
+  const auth = String(req.headers['authorization'] || '');
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return sendJson(res, 401, { error: 'missing_token' });
+  const token = m[1];
+  const claims = verifyJwt(token, JWT_SECRET);
+  if (!claims) return sendJson(res, 401, { error: 'bad_token' });
+  const tokenHash = sha256Hex(token);
+
+  const { data: sess, error: sErr } = await supabase
+    .from('sessions')
+    .select('user_id, expires_at, revoked_at')
+    .eq('token_hash', tokenHash)
+    .maybeSingle();
+  if (sErr) return sendJson(res, 500, { error: 'db_error' });
+  if (!sess || sess.revoked_at) return sendJson(res, 401, { error: 'session_invalid' });
+  if (new Date(sess.expires_at).getTime() < Date.now()) return sendJson(res, 401, { error: 'session_expired' });
+
+  const uid = sess.user_id;
+
+  // Fetch last 30 matches where the user was either Red or Yellow.
+  const { data: matches, error: mErr } = await supabase
+    .from('matches')
+    .select('id, red_user_id, yellow_user_id, winner, started_at, finished_at')
+    .or(`red_user_id.eq.${uid},yellow_user_id.eq.${uid}`)
+    .order('started_at', { ascending: false })
+    .limit(30);
+  if (mErr) return sendJson(res, 500, { error: 'db_error', message: mErr.message });
+
+  if (!matches || matches.length === 0) {
+    return sendJson(res, 200, { ok: true, matches: [] });
+  }
+
+  // Collect opponent user IDs, then fetch usernames in one query.
+  const opponentIds = new Set();
+  for (const mm of matches) {
+    const opp = mm.red_user_id === uid ? mm.yellow_user_id : mm.red_user_id;
+    if (opp) opponentIds.add(opp);
+  }
+  const ids = Array.from(opponentIds);
+  const { data: users, error: uErr } = await supabase
+    .from('users')
+    .select('id, username')
+    .in('id', ids);
+  if (uErr) return sendJson(res, 500, { error: 'db_error', message: uErr.message });
+
+  const usernameById = Object.fromEntries((users || []).map(u => [u.id, u.username]));
+
+  const out = matches.map(mm => {
+    const myColor = mm.red_user_id === uid ? 'red' : 'yellow';
+    const oppId = myColor === 'red' ? mm.yellow_user_id : mm.red_user_id;
+    const result = !mm.winner ? 'unfinished' : (mm.winner === myColor ? 'won' : 'lost');
+    return {
+      id: mm.id,
+      myColor,
+      opponent: usernameById[oppId] || '(unknown)',
+      result,
+      started_at: mm.started_at,
+      finished_at: mm.finished_at,
+    };
+  });
+
+  return sendJson(res, 200, { ok: true, matches: out });
+}
+
 async function handleMe(req, res) {
   const auth = String(req.headers['authorization'] || '');
   const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -176,6 +241,10 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/login') {
     try { return await handleLogin(req, res); }
     catch (e) { console.error('[http] /login error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'GET' && req.url === '/matches') {
+    try { return await handleMatches(req, res); }
+    catch (e) { console.error('[http] /matches error', e); return sendJson(res, 500, { error: 'server_error' }); }
   }
   if (req.method === 'GET' && req.url === '/me') {
     try { return await handleMe(req, res); }
@@ -448,6 +517,7 @@ globalThis.__wsAuthWired = true;
 globalThis.__recordMatchesWired = true;
 
 globalThis.__renderPrep = true;
+globalThis.__matchesEndpoint = true;
 
 process.on('SIGINT', () => {
   console.log('[server] shutting down');
