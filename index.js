@@ -274,6 +274,14 @@ const wss = new WebSocketServer({ server: httpServer });
 let nextClientId = 1;
 let nextGameId = 1;
 const clients = new Map();
+const presenceByUser = new Map(); // userId -> { ws, username, clientId }
+function broadcastPresence() {
+  const users = Array.from(presenceByUser.values()).map(u => ({ username: u.username }));
+  const payload = JSON.stringify({ type: 'presence', users });
+  for (const u of presenceByUser.values()) {
+    if (u.ws && u.ws.readyState === 1) { try { u.ws.send(payload); } catch {} }
+  }
+}
 const games = new Map();
 const clientToGame = new Map();
 
@@ -303,6 +311,11 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     clients.delete(clientId);
+    if (ws.__auth && presenceByUser.has(ws.__auth.userId)) {
+      presenceByUser.delete(ws.__auth.userId);
+      console.log(`[presence] -${ws.__auth.username} (total ${presenceByUser.size})`);
+      broadcastPresence();
+    }
     const gameId = clientToGame.get(clientId);
     if (gameId) {
       const g = games.get(gameId);
@@ -322,6 +335,10 @@ async function handleWsMessage(clientId, ws, msg) {
   switch (msg.type) {
     case 'echo':     return send(ws, { type: 'echo', from: clientId, payload: msg });
     case 'auth':     return onAuth(clientId, ws, msg);
+    case 'listOnline': {
+      const users = Array.from(presenceByUser.values()).map(u => ({ username: u.username }));
+      return send(ws, { type: 'online', users });
+    }
     case 'newGame':  return onNewGame(clientId, ws);
     case 'joinGame': return onJoinGame(clientId, ws, msg);
     case 'rollDice': return onRollDice(clientId, ws);
@@ -355,6 +372,9 @@ async function onAuth(clientId, ws, msg) {
   if (uErr || !user) return sendError(ws, 'auth_user_missing');
 
   ws.__auth = { userId: user.id, username: user.username, email: user.email };
+  presenceByUser.set(user.id, { ws, username: user.username, clientId });
+  console.log(`[presence] +${user.username} (total ${presenceByUser.size})`);
+  broadcastPresence();
   console.log(`[auth] #${clientId} = ${user.username} (${user.id})`);
   send(ws, { type: 'authed', user: { id: user.id, username: user.username, email: user.email } });
 }
@@ -518,6 +538,7 @@ globalThis.__recordMatchesWired = true;
 
 globalThis.__renderPrep = true;
 globalThis.__matchesEndpoint = true;
+globalThis.__presenceWired = true;
 
 process.on('SIGINT', () => {
   console.log('[server] shutting down');
