@@ -138,6 +138,71 @@ async function handleLogin(req, res) {
   });
 }
 
+async function handleGetProfile(req, res, usernameFromPath) {
+  if (!usernameFromPath) return sendJson(res, 400, { error: 'missing_username' });
+  const uname = String(usernameFromPath).trim().toLowerCase();
+
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('username, country, city, age, about, likes, created_at')
+    .eq('username', uname)
+    .maybeSingle();
+  if (error) return sendJson(res, 500, { error: 'db_error' });
+  if (!user) return sendJson(res, 404, { error: 'not_found' });
+
+  return sendJson(res, 200, { ok: true, profile: user });
+}
+
+async function handleUpdateProfile(req, res) {
+  const auth = String(req.headers['authorization'] || '');
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return sendJson(res, 401, { error: 'missing_token' });
+  const token = m[1];
+  const claims = verifyJwt(token, JWT_SECRET);
+  if (!claims) return sendJson(res, 401, { error: 'bad_token' });
+  const tokenHash = sha256Hex(token);
+
+  const { data: sess, error: sErr } = await supabase
+    .from('sessions')
+    .select('user_id, expires_at, revoked_at')
+    .eq('token_hash', tokenHash)
+    .maybeSingle();
+  if (sErr) return sendJson(res, 500, { error: 'db_error' });
+  if (!sess || sess.revoked_at) return sendJson(res, 401, { error: 'session_invalid' });
+  if (new Date(sess.expires_at).getTime() < Date.now()) return sendJson(res, 401, { error: 'session_expired' });
+
+  let body;
+  try { body = await readJson(req); }
+  catch (e) { return sendJson(res, 400, { error: 'bad_body', message: e.message }); }
+
+  const out = {};
+  if (body.country !== undefined) out.country = body.country === null ? null : String(body.country).trim().slice(0, 60) || null;
+  if (body.city    !== undefined) out.city    = body.city    === null ? null : String(body.city).trim().slice(0, 60) || null;
+  if (body.age     !== undefined) {
+    if (body.age === null || body.age === '') out.age = null;
+    else {
+      const n = Number(body.age);
+      if (!Number.isInteger(n) || n < 13 || n > 120) return sendJson(res, 400, { error: 'bad_age', message: 'age must be 13–120' });
+      out.age = n;
+    }
+  }
+  if (body.about   !== undefined) out.about   = body.about   === null ? null : String(body.about).slice(0, 500) || null;
+  if (body.likes   !== undefined) out.likes   = body.likes   === null ? null : String(body.likes).slice(0, 300) || null;
+
+  if (Object.keys(out).length === 0) return sendJson(res, 400, { error: 'nothing_to_update' });
+
+  const { data: updated, error: uErr } = await supabase
+    .from('users')
+    .update(out)
+    .eq('id', sess.user_id)
+    .select('username, country, city, age, about, likes')
+    .maybeSingle();
+  if (uErr) return sendJson(res, 500, { error: 'db_error', message: uErr.message });
+  if (!updated) return sendJson(res, 404, { error: 'user_missing' });
+
+  return sendJson(res, 200, { ok: true, profile: updated });
+}
+
 async function handleMatches(req, res) {
   const auth = String(req.headers['authorization'] || '');
   const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -245,6 +310,15 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/matches') {
     try { return await handleMatches(req, res); }
     catch (e) { console.error('[http] /matches error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'GET' && req.url && req.url.startsWith('/profile/')) {
+    const uname = decodeURIComponent(req.url.slice('/profile/'.length));
+    try { return await handleGetProfile(req, res, uname); }
+    catch (e) { console.error('[http] /profile GET error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'POST' && req.url === '/profile') {
+    try { return await handleUpdateProfile(req, res); }
+    catch (e) { console.error('[http] /profile POST error', e); return sendJson(res, 500, { error: 'server_error' }); }
   }
   if (req.method === 'GET' && req.url === '/me') {
     try { return await handleMe(req, res); }
@@ -539,6 +613,7 @@ globalThis.__recordMatchesWired = true;
 globalThis.__renderPrep = true;
 globalThis.__matchesEndpoint = true;
 globalThis.__presenceWired = true;
+globalThis.__profilesWired = true;
 
 process.on('SIGINT', () => {
   console.log('[server] shutting down');
