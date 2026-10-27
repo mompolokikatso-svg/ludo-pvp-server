@@ -394,8 +394,7 @@ wss.on('connection', (ws, req) => {
     if (gameId) {
       const g = games.get(gameId);
       if (g) {
-        g.players = g.players.filter(p => p !== clientId);
-        if (g.players.length === 0) { games.delete(gameId); console.log(`[game ${gameId}] deleted (no players)`); }
+        console.log(`[game ${gameId}] player disconnected; reserving their seat`);
       }
       clientToGame.delete(clientId);
     }
@@ -478,9 +477,21 @@ async function onJoinGame(clientId, ws, msg) {
   if (!Number.isInteger(gameId)) return sendError(ws, 'bad_gameId');
   const g = games.get(gameId);
   if (!g) return sendError(ws, 'game_not_found', { gameId });
+  if (!g.users) g.users = [null, null];
+  const existingSeat = g.users.findIndex(userId => userId === ws.__auth.userId);
+  if (existingSeat >= 0) {
+    const oldClientId = g.players[existingSeat];
+    if (oldClientId && oldClientId !== clientId) clientToGame.delete(oldClientId);
+    g.players[existingSeat] = clientId;
+    clientToGame.set(clientId, gameId);
+    const myColor = existingSeat === 0 ? 'red' : 'yellow';
+    console.log(`[game ${gameId}] user reconnected as ${myColor}`);
+    send(ws, { type: 'joined', gameId, yourColor: myColor, state: publicState(g.state), reconnected: true });
+    broadcast(gameId, { type: 'opponentJoined', gameId, state: publicState(g.state) });
+    return;
+  }
   if (g.players.length >= 2) return sendError(ws, 'game_full', { gameId });
   g.players.push(clientId);
-  if (!g.users) g.users = [null, null];
   g.users[1] = ws.__auth.userId;
   clientToGame.set(clientId, gameId);
   const myColor = g.players[0] === clientId ? 'red' : 'yellow';
@@ -512,7 +523,19 @@ function onGetState(clientId, ws) {
   if (!gameId) return sendError(ws, 'not_in_game');
   const g = games.get(gameId);
   if (!g) return sendError(ws, 'game_gone');
-  send(ws, { type: 'state', gameId, state: publicState(g.state) });
+  const seat = g.players.indexOf(clientId);
+  if (seat < 0 || seat > 1) return sendError(ws, 'not_in_game');
+  const color = seat === 0 ? 'red' : 'yellow';
+  const moves = g.lastDice && g.state.current === color
+    ? E.legalMoves(g.state, color, g.lastDice)
+    : [];
+  send(ws, {
+    type: 'state',
+    gameId,
+    state: publicState(g.state),
+    pendingDice: g.lastDice,
+    moves
+  });
 }
 function onRollDice(clientId, ws) {
   const gameId = clientToGame.get(clientId);
