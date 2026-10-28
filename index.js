@@ -144,7 +144,7 @@ async function handleGetProfile(req, res, usernameFromPath) {
 
   const { data: user, error } = await supabase
     .from('users')
-    .select('username, country, city, age, about, likes, created_at')
+    .select('username, country, city, age, about, likes, avatar, created_at')
     .eq('username', uname)
     .maybeSingle();
   if (error) return sendJson(res, 500, { error: 'db_error' });
@@ -188,6 +188,13 @@ async function handleUpdateProfile(req, res) {
   }
   if (body.about   !== undefined) out.about   = body.about   === null ? null : String(body.about).slice(0, 500) || null;
   if (body.likes   !== undefined) out.likes   = body.likes   === null ? null : String(body.likes).slice(0, 300) || null;
+  if (body.avatar !== undefined) {
+    const allowedAvatars = ['avatar-1','avatar-2','avatar-3','avatar-4','avatar-5','avatar-6','avatar-7','avatar-8'];
+    if (body.avatar !== null && allowedAvatars.includes(body.avatar) === false) {
+      return sendJson(res, 400, { error: 'bad_avatar' });
+    }
+    out.avatar = body.avatar;
+  }
 
   if (Object.keys(out).length === 0) return sendJson(res, 400, { error: 'nothing_to_update' });
 
@@ -195,7 +202,7 @@ async function handleUpdateProfile(req, res) {
     .from('users')
     .update(out)
     .eq('id', sess.user_id)
-    .select('username, country, city, age, about, likes')
+    .select('username, country, city, age, about, likes, avatar')
     .maybeSingle();
   if (uErr) return sendJson(res, 500, { error: 'db_error', message: uErr.message });
   if (!updated) return sendJson(res, 404, { error: 'user_missing' });
