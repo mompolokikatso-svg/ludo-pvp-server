@@ -417,6 +417,9 @@ async function handleWsMessage(clientId, ws, msg) {
     case 'rollDice': return onRollDice(clientId, ws);
     case 'move':     return onMove(clientId, ws, msg);
     case 'getState': return onGetState(clientId, ws);
+    case 'rematchRequest': return onRematchRequest(clientId, ws);
+    case 'rematchAccept': return onRematchAccept(clientId, ws);
+    case 'rematchDecline': return onRematchDecline(clientId, ws);
     default:         return sendError(ws, 'unknown_type', { got: msg.type });
   }
 }
@@ -614,6 +617,121 @@ async function onMove(clientId, ws, msg) {
     sendError(ws, 'engine_error', { message: err.message });
   }
 }
+function getRematchGame(clientId, ws, action) {
+  if (!requireAuth(ws, action)) return null;
+  const gameId = clientToGame.get(clientId);
+  const g = gameId && games.get(gameId);
+  if (!g) {
+    sendError(ws, 'not_in_game');
+    return null;
+  }
+  const seat = g.players.indexOf(clientId);
+  if (seat < 0 || seat > 1 || g.players.length !== 2) {
+    sendError(ws, 'not_in_game');
+    return null;
+  }
+  if (!g.state.winner) {
+    sendError(ws, 'game_not_finished');
+    return null;
+  }
+  return { gameId, g, seat };
+}
+
+function onRematchRequest(clientId, ws) {
+  const found = getRematchGame(clientId, ws, 'rematchRequest');
+  if (!found) return;
+  const { gameId, g, seat } = found;
+  if (g.rematchRequester) return sendError(ws, 'rematch_already_requested');
+  const opponentId = g.players[1 - seat];
+  const opponentWs = clients.get(opponentId);
+  if (!opponentWs || opponentWs.readyState !== 1) {
+    return sendError(ws, 'opponent_disconnected');
+  }
+  g.rematchRequester = ws.__auth.userId;
+  send(ws, { type: 'rematchWaiting' });
+  send(opponentWs, {
+    type: 'rematchRequested',
+    fromColor: seat === 0 ? 'red' : 'yellow'
+  });
+}
+
+async function onRematchAccept(clientId, ws) {
+  const found = getRematchGame(clientId, ws, 'rematchAccept');
+  if (!found) return;
+  const { gameId, g } = found;
+  if (!g.rematchRequester) return sendError(ws, 'no_rematch_request');
+  if (g.rematchRequester === ws.__auth.userId) {
+    return sendError(ws, 'cannot_accept_own_rematch');
+  }
+  if (g.rematchStarting) return sendError(ws, 'rematch_already_starting');
+
+  for (const playerId of g.players) {
+    const playerWs = clients.get(playerId);
+    if (!playerWs || playerWs.readyState !== 1) {
+      return sendError(ws, 'opponent_disconnected');
+    }
+  }
+
+  g.rematchStarting = true;
+  try {
+    g.players.reverse();
+    g.users.reverse();
+    g.state = E.newGame(['red', 'yellow']);
+    g.lastDice = null;
+    g.rematchRequester = null;
+    g.matchFinalized = false;
+    g.moveSeq = 0;
+    g.matchId = null;
+
+    try {
+      const { data, error } = await supabase.from('matches').insert({
+        game: 'ludo',
+        red_user_id: g.users[0],
+        yellow_user_id: g.users[1],
+      }).select('id').single();
+      if (error) console.warn('[db] rematch insert failed:', error.message);
+      else {
+        g.matchId = data.id;
+        console.log('[game ' + gameId + '] rematch row created ' + g.matchId);
+      }
+    } catch (e) {
+      console.warn('[db] rematch insert threw:', e.message);
+    }
+
+    const payload = JSON.stringify({
+      type: 'rematchStarted',
+      gameId,
+      state: publicState(g.state)
+    });
+    for (let seat = 0; seat < 2; seat++) {
+      const playerId = g.players[seat];
+      const playerWs = clients.get(playerId);
+      if (playerWs && playerWs.readyState === 1) {
+        try {
+          playerWs.send(JSON.stringify({
+            type: 'rematchStarted',
+            gameId,
+            yourColor: seat === 0 ? 'red' : 'yellow',
+            state: publicState(g.state)
+          }));
+        } catch {}
+      }
+    }
+    console.log('[game ' + gameId + '] rematch started with swapped colours');
+  } finally {
+    g.rematchStarting = false;
+  }
+}
+
+function onRematchDecline(clientId, ws) {
+  const found = getRematchGame(clientId, ws, 'rematchDecline');
+  if (!found) return;
+  const { gameId, g } = found;
+  if (!g.rematchRequester) return sendError(ws, 'no_rematch_request');
+  g.rematchRequester = null;
+  broadcast(gameId, { type: 'rematchDeclined' });
+}
+
 function publicState(state) {
   return { players: state.players, current: state.current, winner: state.winner, tokens: state.tokens };
 }
