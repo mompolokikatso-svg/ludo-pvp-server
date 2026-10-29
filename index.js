@@ -354,6 +354,7 @@ const wss = new WebSocketServer({ server: httpServer });
 
 let nextClientId = 1;
 let nextGameId = 1;
+let nextChallengeId = 1;
 const clients = new Map();
 const presenceByUser = new Map(); // userId -> { ws, username, clientId }
 function broadcastPresence() {
@@ -365,6 +366,7 @@ function broadcastPresence() {
 }
 const games = new Map();
 const clientToGame = new Map();
+const pendingChallenges = new Map();
 
 function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
 function sendError(ws, error, extra = {}) { send(ws, { type: 'error', error, ...extra }); }
@@ -392,10 +394,32 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     clients.delete(clientId);
-    if (ws.__auth && presenceByUser.has(ws.__auth.userId)) {
-      presenceByUser.delete(ws.__auth.userId);
-      console.log(`[presence] -${ws.__auth.username} (total ${presenceByUser.size})`);
-      broadcastPresence();
+    if (ws.__auth) {
+      const currentPresence = presenceByUser.get(ws.__auth.userId);
+      if (currentPresence && currentPresence.clientId === clientId) {
+        presenceByUser.delete(ws.__auth.userId);
+        console.log(`[presence] -${ws.__auth.username} (total ${presenceByUser.size})`);
+        broadcastPresence();
+      }
+
+      for (const [challengeId, challenge] of pendingChallenges) {
+        if (challenge.fromClientId === clientId || challenge.toClientId === clientId) {
+          pendingChallenges.delete(challengeId);
+          const otherClientId = challenge.fromClientId === clientId
+            ? challenge.toClientId
+            : challenge.fromClientId;
+          const otherWs = clients.get(otherClientId);
+          if (otherWs && otherWs.readyState === 1) {
+            send(otherWs, {
+              type: 'challengeUnavailable',
+              challengeId,
+              username: challenge.fromClientId === clientId
+                ? challenge.fromUsername
+                : challenge.toUsername
+            });
+          }
+        }
+      }
     }
     const gameId = clientToGame.get(clientId);
     if (gameId) {
@@ -421,6 +445,9 @@ async function handleWsMessage(clientId, ws, msg) {
     }
     case 'newGame':  return onNewGame(clientId, ws);
     case 'joinGame': return onJoinGame(clientId, ws, msg);
+    case 'challengeRequest': return onChallengeRequest(clientId, ws, msg);
+    case 'challengeAccept': return onChallengeAccept(clientId, ws, msg);
+    case 'challengeDecline': return onChallengeDecline(clientId, ws, msg);
     case 'rollDice': return onRollDice(clientId, ws);
     case 'move':     return onMove(clientId, ws, msg);
     case 'getState': return onGetState(clientId, ws);
@@ -468,6 +495,170 @@ function requireAuth(ws, what) {
     return false;
   }
   return true;
+}
+
+
+function onChallengeRequest(clientId, ws, msg) {
+  if (!requireAuth(ws, 'challengeRequest')) return;
+  if (clientToGame.has(clientId)) {
+    return sendError(ws, 'already_in_game', { gameId: clientToGame.get(clientId) });
+  }
+
+  const targetUsername = typeof msg.targetUsername === 'string'
+    ? msg.targetUsername.trim()
+    : '';
+  if (!targetUsername) return sendError(ws, 'challenge_missing_target');
+  if (targetUsername.toLowerCase() === ws.__auth.username.toLowerCase()) {
+    return sendError(ws, 'cannot_challenge_self');
+  }
+
+  const target = Array.from(presenceByUser.entries()).find(
+    ([, user]) => user.username.toLowerCase() === targetUsername.toLowerCase()
+  );
+  if (!target) return sendError(ws, 'player_offline');
+
+  const [toUserId, targetPresence] = target;
+  if (toUserId === ws.__auth.userId) return sendError(ws, 'cannot_challenge_self');
+
+  const targetWs = targetPresence.ws;
+  const targetClientId = targetPresence.clientId;
+  if (!targetWs || targetWs.readyState !== 1) return sendError(ws, 'player_offline');
+  if (clientToGame.has(targetClientId)) return sendError(ws, 'player_busy');
+
+  for (const challenge of pendingChallenges.values()) {
+    if (
+      (challenge.fromUserId === ws.__auth.userId && challenge.toUserId === toUserId) ||
+      (challenge.fromUserId === toUserId && challenge.toUserId === ws.__auth.userId)
+    ) {
+      return sendError(ws, 'challenge_already_pending');
+    }
+  }
+
+  const challengeId = nextChallengeId++;
+  const challenge = {
+    challengeId,
+    fromUserId: ws.__auth.userId,
+    fromUsername: ws.__auth.username,
+    fromClientId: clientId,
+    toUserId,
+    toUsername: targetPresence.username,
+    toClientId: targetClientId,
+    createdAt: Date.now()
+  };
+  pendingChallenges.set(challengeId, challenge);
+
+  send(ws, {
+    type: 'challengeSent',
+    challengeId,
+    targetUsername: targetPresence.username
+  });
+  send(targetWs, {
+    type: 'challengeReceived',
+    challengeId,
+    fromUsername: ws.__auth.username
+  });
+}
+
+async function onChallengeAccept(clientId, ws, msg) {
+  if (!requireAuth(ws, 'challengeAccept')) return;
+  const challengeId = msg.challengeId;
+  const challenge = pendingChallenges.get(challengeId);
+
+  if (!challenge) return sendError(ws, 'challenge_not_found');
+  if (challenge.toUserId !== ws.__auth.userId || challenge.toClientId !== clientId) {
+    return sendError(ws, 'not_challenge_target');
+  }
+  if (clientToGame.has(clientId)) return sendError(ws, 'already_in_game');
+  if (clientToGame.has(challenge.fromClientId)) return sendError(ws, 'challenger_busy');
+
+  const challengerWs = clients.get(challenge.fromClientId);
+  const currentTarget = presenceByUser.get(challenge.toUserId);
+  const currentChallenger = presenceByUser.get(challenge.fromUserId);
+
+  if (!challengerWs || challengerWs.readyState !== 1 ||
+      !currentChallenger || currentChallenger.clientId !== challenge.fromClientId) {
+    pendingChallenges.delete(challengeId);
+    send(ws, { type: 'challengeUnavailable', challengeId, username: challenge.fromUsername });
+    return;
+  }
+  if (!currentTarget || currentTarget.clientId !== clientId) {
+    pendingChallenges.delete(challengeId);
+    return sendError(ws, 'challenge_target_disconnected');
+  }
+
+  pendingChallenges.delete(challengeId);
+
+  const gameId = nextGameId++;
+  const state = E.newGame(['red', 'yellow']);
+  const g = {
+    state,
+    lastDice: null,
+    players: [challenge.fromClientId, clientId],
+    users: [challenge.fromUserId, challenge.toUserId],
+    matchId: null,
+    moveSeq: 0
+  };
+  games.set(gameId, g);
+  clientToGame.set(challenge.fromClientId, gameId);
+  clientToGame.set(clientId, gameId);
+
+  try {
+    const { data, error } = await supabase.from('matches').insert({
+      game: 'ludo',
+      red_user_id: challenge.fromUserId,
+      yellow_user_id: challenge.toUserId
+    }).select('id').single();
+
+    if (error) {
+      console.warn('[db] challenge match insert failed:', error.message);
+    } else {
+      g.matchId = data.id;
+      console.log(`[game ${gameId}] challenge match row created ${g.matchId}`);
+    }
+  } catch (e) {
+    console.warn('[db] challenge match insert threw:', e.message);
+  }
+
+  send(challengerWs, {
+    type: 'challengeGameReady',
+    challengeId,
+    gameId,
+    yourColor: 'red',
+    opponentUsername: challenge.toUsername,
+    state: publicState(state)
+  });
+  send(ws, {
+    type: 'challengeGameReady',
+    challengeId,
+    gameId,
+    yourColor: 'yellow',
+    opponentUsername: challenge.fromUsername,
+    state: publicState(state)
+  });
+
+  console.log(`[game ${gameId}] challenge accepted: ${challenge.fromUsername} vs ${challenge.toUsername}`);
+}
+
+function onChallengeDecline(clientId, ws, msg) {
+  if (!requireAuth(ws, 'challengeDecline')) return;
+  const challengeId = msg.challengeId;
+  const challenge = pendingChallenges.get(challengeId);
+
+  if (!challenge) return sendError(ws, 'challenge_not_found');
+  if (challenge.toUserId !== ws.__auth.userId || challenge.toClientId !== clientId) {
+    return sendError(ws, 'not_challenge_target');
+  }
+
+  pendingChallenges.delete(challengeId);
+  const challengerWs = clients.get(challenge.fromClientId);
+  if (challengerWs && challengerWs.readyState === 1) {
+    send(challengerWs, {
+      type: 'challengeDeclined',
+      challengeId,
+      username: challenge.toUsername
+    });
+  }
+  send(ws, { type: 'challengeDeclineSent', challengeId });
 }
 
 function onNewGame(clientId, ws) {
