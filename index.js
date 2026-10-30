@@ -11,6 +11,12 @@ import { supabase } from './supabase.js';
 import * as E from './engine.js';
 import { verifyJwt, sha256Hex, newSessionToken } from './auth.js';
 import { JWT_SECRET } from './supabase.js';
+import {
+  getOrCreateWallet,
+  listTransactions as walletListTransactions,
+  createDepositRequest,
+  createWithdrawRequest,
+} from './wallet.js';
 
 // ---------- HTTP server (register / login later) ----------
 
@@ -303,6 +309,120 @@ async function handleMe(req, res) {
   return sendJson(res, 200, { ok: true, user });
 }
 
+
+// ---------- Wallet HTTP helpers and handlers ----------
+async function requireSession(req, res) {
+  const auth = String(req.headers['authorization'] || '');
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) { sendJson(res, 401, { error: 'missing_token' }); return null; }
+  const token = m[1];
+  const claims = verifyJwt(token, JWT_SECRET);
+  if (!claims) { sendJson(res, 401, { error: 'bad_token' }); return null; }
+  const tokenHash = sha256Hex(token);
+
+  const { data: sess, error } = await supabase
+    .from('sessions')
+    .select('user_id, expires_at, revoked_at')
+    .eq('token_hash', tokenHash)
+    .maybeSingle();
+  if (error) { sendJson(res, 500, { error: 'db_error' }); return null; }
+  if (!sess || sess.revoked_at) { sendJson(res, 401, { error: 'session_invalid' }); return null; }
+  if (new Date(sess.expires_at).getTime() < Date.now()) { sendJson(res, 401, { error: 'session_expired' }); return null; }
+  return { userId: sess.user_id };
+}
+
+function unifiedWallet(w) {
+  const balance  = Number(w?.balance_minor  ?? 0);
+  const reserved = Number(w?.reserved_minor ?? 0);
+  return {
+    balance_minor: balance,
+    reserved_minor: reserved,
+    available_minor: balance - reserved,
+    currency: 'MHC',
+    is_demo: true,
+  };
+}
+
+async function handleWalletGet(req, res) {
+  const sess = await requireSession(req, res);
+  if (!sess) return;
+  try {
+    const w = await getOrCreateWallet(sess.userId);
+    const txns = await walletListTransactions(sess.userId, 20);
+    return sendJson(res, 200, { ok: true, wallet: unifiedWallet(w), transactions: txns });
+  } catch (e) {
+    return sendJson(res, 500, { error: 'wallet_read_failed', message: e.message });
+  }
+}
+
+async function handleWalletTransactions(req, res) {
+  const sess = await requireSession(req, res);
+  if (!sess) return;
+  const url = new URL(req.url, 'http://localhost');
+  const limit  = Math.min(Math.max(Number(url.searchParams.get('limit') || 20), 1), 100);
+  const before = url.searchParams.get('before') || null;
+  try {
+    const txns = await walletListTransactions(sess.userId, limit, before);
+    return sendJson(res, 200, { ok: true, transactions: txns });
+  } catch (e) {
+    return sendJson(res, 500, { error: 'wallet_read_failed', message: e.message });
+  }
+}
+
+async function handleWalletDepositRequest(req, res) {
+  const sess = await requireSession(req, res);
+  if (!sess) return;
+  let body;
+  try { body = await readJson(req); }
+  catch (e) { return sendJson(res, 400, { error: 'bad_body', message: e.message }); }
+
+  const amount = Number(body.amount_minor);
+  const note = typeof body.note === 'string' ? body.note.slice(0, 500) : null;
+  if (!Number.isInteger(amount) || amount <= 0) return sendJson(res, 400, { error: 'bad_amount' });
+
+  try {
+    const req_row = await createDepositRequest(sess.userId, amount, note);
+    const w = await getOrCreateWallet(sess.userId);
+    return sendJson(res, 200, {
+      ok: true,
+      wallet: unifiedWallet(w),
+      request: { id: req_row.id, reference: req_row.reference, amount_minor: amount, status: req_row.status },
+    });
+  } catch (e) {
+    if (e.message === 'bad_amount') return sendJson(res, 400, { error: 'bad_amount' });
+    if (e.message === 'duplicate_reference') return sendJson(res, 409, { error: 'duplicate_reference' });
+    return sendJson(res, 500, { error: 'wallet_deposit_failed', message: e.message });
+  }
+}
+
+async function handleWalletWithdrawRequest(req, res) {
+  const sess = await requireSession(req, res);
+  if (!sess) return;
+  let body;
+  try { body = await readJson(req); }
+  catch (e) { return sendJson(res, 400, { error: 'bad_body', message: e.message }); }
+
+  const amount = Number(body.amount_minor);
+  const note = typeof body.note === 'string' ? body.note.slice(0, 500) : null;
+  if (!Number.isInteger(amount) || amount <= 0) return sendJson(res, 400, { error: 'bad_amount' });
+
+  try {
+    const r = await createWithdrawRequest(sess.userId, amount, note);
+    const w = await getOrCreateWallet(sess.userId);
+    return sendJson(res, 200, {
+      ok: true,
+      wallet: unifiedWallet(w),
+      request: { id: r.txn_id, reference: r.reference, amount_minor: amount, status: 'pending' },
+    });
+  } catch (e) {
+    if (e.message === 'insufficient_funds') return sendJson(res, 400, { error: 'insufficient_funds' });
+    if (e.message === 'bad_amount') return sendJson(res, 400, { error: 'bad_amount' });
+    if (e.message === 'duplicate_reference') return sendJson(res, 409, { error: 'duplicate_reference' });
+    if (e.message === 'wallet_not_found') return sendJson(res, 500, { error: 'wallet_not_found' });
+    return sendJson(res, 500, { error: 'wallet_withdraw_failed', message: e.message });
+  }
+}
+
 const httpServer = http.createServer(async (req, res) => {
   // Basic CORS for local dev
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -334,6 +454,22 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/register') {
     try { return await handleRegister(req, res); }
     catch (e) { console.error('[http] /register error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'GET' && req.url === '/wallet') {
+    try { return await handleWalletGet(req, res); }
+    catch (e) { console.error('[http] /wallet error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'GET' && req.url && req.url.startsWith('/wallet/transactions')) {
+    try { return await handleWalletTransactions(req, res); }
+    catch (e) { console.error('[http] /wallet/transactions error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'POST' && req.url === '/wallet/deposit-request') {
+    try { return await handleWalletDepositRequest(req, res); }
+    catch (e) { console.error('[http] /wallet/deposit-request error', e); return sendJson(res, 500, { error: 'server_error' }); }
+  }
+  if (req.method === 'POST' && req.url === '/wallet/withdraw-request') {
+    try { return await handleWalletWithdrawRequest(req, res); }
+    catch (e) { console.error('[http] /wallet/withdraw-request error', e); return sendJson(res, 500, { error: 'server_error' }); }
   }
   if (req.method === 'GET' && req.url === '/health') {
     return sendJson(res, 200, { ok: true });
@@ -974,6 +1110,7 @@ globalThis.__wsAuthWired = true;
 globalThis.__recordMatchesWired = true;
 
 globalThis.__renderPrep = true;
+globalThis.__walletRoutesWired = true;
 globalThis.__matchesEndpoint = true;
 globalThis.__presenceWired = true;
 globalThis.__profilesWired = true;
