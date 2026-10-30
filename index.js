@@ -360,8 +360,10 @@ const presenceByUser = new Map(); // userId -> { ws, username, clientId }
 function broadcastPresence() {
   const users = Array.from(presenceByUser.values()).map(u => ({ username: u.username }));
   const payload = JSON.stringify({ type: 'presence', users });
-  for (const u of presenceByUser.values()) {
-    if (u.ws && u.ws.readyState === 1) { try { u.ws.send(payload); } catch {} }
+  for (const clientWs of clients.values()) {
+    if (clientWs.__auth && clientWs.readyState === 1) {
+      try { clientWs.send(payload); } catch {}
+    }
   }
 }
 const games = new Map();
@@ -397,8 +399,25 @@ wss.on('connection', (ws, req) => {
     if (ws.__auth) {
       const currentPresence = presenceByUser.get(ws.__auth.userId);
       if (currentPresence && currentPresence.clientId === clientId) {
-        presenceByUser.delete(ws.__auth.userId);
-        console.log(`[presence] -${ws.__auth.username} (total ${presenceByUser.size})`);
+        const replacement = Array.from(clients.entries()).find(
+          ([otherClientId, otherWs]) =>
+            otherClientId !== clientId &&
+            otherWs.__auth &&
+            otherWs.__auth.userId === ws.__auth.userId &&
+            otherWs.readyState === 1
+        );
+
+        if (replacement) {
+          const [replacementClientId, replacementWs] = replacement;
+          presenceByUser.set(ws.__auth.userId, {
+            ws: replacementWs,
+            username: replacementWs.__auth.username,
+            clientId: replacementClientId
+          });
+        } else {
+          presenceByUser.delete(ws.__auth.userId);
+          console.log(`[presence] -${ws.__auth.username} (total ${presenceByUser.size})`);
+        }
         broadcastPresence();
       }
 
@@ -552,11 +571,17 @@ function onChallengeRequest(clientId, ws, msg) {
     challengeId,
     targetUsername: targetPresence.username
   });
-  send(targetWs, {
-    type: 'challengeReceived',
-    challengeId,
-    fromUsername: ws.__auth.username
-  });
+  for (const targetConnection of clients.values()) {
+    if (targetConnection.__auth &&
+        targetConnection.__auth.userId === toUserId &&
+        targetConnection.readyState === 1) {
+      send(targetConnection, {
+        type: 'challengeReceived',
+        challengeId,
+        fromUsername: ws.__auth.username
+      });
+    }
+  }
 }
 
 async function onChallengeAccept(clientId, ws, msg) {
@@ -565,23 +590,22 @@ async function onChallengeAccept(clientId, ws, msg) {
   const challenge = pendingChallenges.get(challengeId);
 
   if (!challenge) return sendError(ws, 'challenge_not_found');
-  if (challenge.toUserId !== ws.__auth.userId || challenge.toClientId !== clientId) {
+  if (challenge.toUserId !== ws.__auth.userId) {
     return sendError(ws, 'not_challenge_target');
   }
   if (clientToGame.has(clientId)) return sendError(ws, 'already_in_game');
   if (clientToGame.has(challenge.fromClientId)) return sendError(ws, 'challenger_busy');
 
   const challengerWs = clients.get(challenge.fromClientId);
-  const currentTarget = presenceByUser.get(challenge.toUserId);
-  const currentChallenger = presenceByUser.get(challenge.fromUserId);
+  const currentChallenger = challengerWs && challengerWs.__auth;
 
   if (!challengerWs || challengerWs.readyState !== 1 ||
-      !currentChallenger || currentChallenger.clientId !== challenge.fromClientId) {
+      !currentChallenger || currentChallenger.userId !== challenge.fromUserId) {
     pendingChallenges.delete(challengeId);
     send(ws, { type: 'challengeUnavailable', challengeId, username: challenge.fromUsername });
     return;
   }
-  if (!currentTarget || currentTarget.clientId !== clientId) {
+  if (!presenceByUser.has(challenge.toUserId)) {
     pendingChallenges.delete(challengeId);
     return sendError(ws, 'challenge_target_disconnected');
   }
